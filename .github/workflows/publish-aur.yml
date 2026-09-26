@@ -1,0 +1,67 @@
+name: Publish to AUR
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out package
+        uses: actions/checkout@v6
+
+      - name: Publish package to AUR
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "$AUR_SSH_KEY" ]] || {
+            echo "AUR_SSH_KEY is not configured." >&2
+            exit 1
+          }
+
+          install -d -m 700 ~/.ssh
+
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+
+          ssh-keyscan \
+            -H \
+            aur.archlinux.org \
+            > ~/.ssh/known_hosts
+
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git clone \
+            ssh://aur@aur.archlinux.org/git-credential-manager.git \
+            aur
+
+          cp PKGBUILD .SRCINFO aur/
+
+          cd aur
+
+          if git diff --quiet -- PKGBUILD .SRCINFO; then
+            echo "AUR is already up to date."
+            exit 0
+          fi
+
+          git add PKGBUILD .SRCINFO
+
+          version="$(sed -n 's/^pkgver=//p' PKGBUILD)"
+
+          git commit \
+            -m "Update git-credential-manager to $version"
+
+          git push origin master
