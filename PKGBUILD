@@ -45,7 +45,7 @@ build() {
 
     # Restore serially: multiple projects use the same generated out/.../obj
     # directory, so .NET 10's parallel restore can race creating project.assets.json.
-    dotnet restore Git-Credential-Manager.sln \
+    dotnet restore Git-Credential-Manager.slnx \
         --runtime $_rid \
         --disable-parallel \
         -p:Configuration=LinuxRelease \
@@ -54,7 +54,7 @@ build() {
 
     # -p:ImportByWildcardBeforeSolution=false bypasses NETSDK1134 safely,
     # letting us build the entire solution for our targeted architecture.
-    dotnet build Git-Credential-Manager.sln \
+    dotnet build Git-Credential-Manager.slnx \
         --no-restore \
         --configuration LinuxRelease \
         --runtime $_rid \
