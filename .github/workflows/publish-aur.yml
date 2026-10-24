@@ -1,5 +1,5 @@
 
-name: Publish to AUR
+name: Build and publish AUR package
 
 on:
   push:
@@ -9,47 +9,141 @@ on:
       - PKGBUILD
       - .SRCINFO
       - .github/workflows/aur-publish.yml
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - PKGBUILD
+      - .SRCINFO
+      - .github/workflows/aur-publish.yml
+
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the successfully built package recipe to the AUR
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 jobs:
-  publish:
-    name: Publish package recipe to AUR
+  build:
+    name: Validate and build in Arch Linux
     runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out package
+        uses: actions/checkout@v6
+
+      - name: Build package in a clean Arch Linux container
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          output_dir="$RUNNER_TEMP/package-output"
+          mkdir -p "$output_dir"
+
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/source:ro" \
+            --volume "$output_dir:/out" \
+            archlinux:latest \
+            bash -euo pipefail -c '
+              pacman -Syu --noconfirm --needed base-devel git sudo
+
+              useradd --create-home builder
+
+              # Allow the disposable build user to install dependencies.
+              printf "builder ALL=(ALL) NOPASSWD: /usr/bin/pacman\n" \
+                > /etc/sudoers.d/builder
+              chmod 440 /etc/sudoers.d/builder
+
+              install -d -o builder -g builder /build
+              cp -a /source/. /build/
+              chown -R builder:builder /build
+
+              runuser -u builder -- \
+                bash -euo pipefail -c "
+                  cd /build
+
+                  # Reject stale or inconsistent committed metadata.
+                  makepkg --printsrcinfo > .SRCINFO.generated
+                  cmp .SRCINFO .SRCINFO.generated
+                  rm .SRCINFO.generated
+
+                  # Build and install missing dependencies inside the container.
+                  makepkg --syncdeps --noconfirm --cleanbuild
+                "
+
+              mkdir -p /out/aur
+
+              cp /build/PKGBUILD /build/.SRCINFO /out/aur/
+
+              find /build \
+                -maxdepth 1 \
+                -type f \
+                -name "*.pkg.tar.*" \
+                ! -name "*.sig" \
+                -exec cp {} /out/ \;
+
+              compgen -G "/out/*.pkg.tar.*" > /dev/null || {
+                echo "No package archive was produced." >&2
+                exit 1
+              }
+            '
+
+      - name: Upload built package
+        uses: actions/upload-artifact@v4
+        with:
+          name: git-credential-manager-package
+          path: ${{ runner.temp }}/package-output/*.pkg.tar.*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload AUR source bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: aur-source-bundle
+          path: ${{ runner.temp }}/package-output/aur/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-aur:
+    name: Publish package recipe to AUR
+    needs: build
+
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+
+    runs-on: ubuntu-latest
+    environment: aur-production
 
     env:
       AUR_PACKAGE: git-credential-manager
       AUR_GIT_NAME: GitHub Actions
       AUR_GIT_EMAIL: actions@users.noreply.github.com
-      AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_KEY }}
 
     steps:
-      - name: Check out package
-        uses: actions/checkout@v4
-
-      - name: Validate package sources
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          for file in PKGBUILD .SRCINFO; do
-            if [[ ! -f "$file" ]]; then
-              echo "Required package source file is missing: $file" >&2
-              exit 1
-            fi
-          done
-
       - name: Check AUR credentials
         shell: bash
         run: |
           set -euo pipefail
 
-          if [[ -z "$AUR_SSH_KEY" ]]; then
+          if [[ -z "$AUR_SSH_PRIVATE_KEY" ]]; then
             echo "Missing required AUR_SSH_KEY GitHub secret." >&2
             exit 1
           fi
+
+      - name: Download generated AUR files
+        uses: actions/download-artifact@v4
+        with:
+          name: aur-source-bundle
+          path: aur-source-bundle
 
       - name: Configure SSH for the AUR
         shell: bash
@@ -58,8 +152,8 @@ jobs:
 
           install -d -m 700 ~/.ssh
 
-          # Normalize CRLF line endings in the GitHub secret.
-          printf '%s' "$AUR_SSH_KEY" |
+          # Normalize CRLF in secrets copied from Windows.
+          printf '%s' "$AUR_SSH_PRIVATE_KEY" |
             tr -d '\r' > ~/.ssh/aur_key
           printf '\n' >> ~/.ssh/aur_key
 
@@ -72,10 +166,8 @@ jobs:
 
           ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
 
-          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes"
-
-          # Persist SSH configuration for subsequent workflow steps.
-          echo "GIT_SSH_COMMAND=$GIT_SSH_COMMAND" >> "$GITHUB_ENV"
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/aur_key -o IdentitiesOnly=yes" \
+            >> "$GITHUB_ENV"
 
       - name: Update the AUR repository
         shell: bash
@@ -88,17 +180,25 @@ jobs:
             "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" \
             "$aur_dir"
 
-          # Replace only the package files, preserving Git metadata.
-          cp PKGBUILD .SRCINFO "$aur_dir/"
+          # Keep .git, but remove old package files.
+          find "$aur_dir" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            ! -name .git \
+            -exec rm -rf {} +
+
+          cp \
+            aur-source-bundle/PKGBUILD \
+            aur-source-bundle/.SRCINFO \
+            "$aur_dir/"
 
           cd "$aur_dir"
 
           git config user.name "$AUR_GIT_NAME"
           git config user.email "$AUR_GIT_EMAIL"
 
-          git add PKGBUILD .SRCINFO
+          git add -A
 
-          # Check the staged changes, not the working tree.
           if git diff --cached --quiet; then
             echo "AUR already contains these package sources; nothing to publish."
             exit 0
@@ -108,11 +208,11 @@ jobs:
           release="$(sed -n 's/^pkgrel=//p' PKGBUILD | head -n 1)"
 
           if [[ -z "$version" || -z "$release" ]]; then
-            echo "Could not determine pkgver or pkgrel from PKGBUILD." >&2
+            echo "Could not determine pkgver or pkgrel." >&2
             exit 1
           fi
 
           git commit \
-            -m "Update git-credential-manager to ${version}-${release}"
+            -m "Update to ${version}-${release}"
 
           git push origin HEAD:master
