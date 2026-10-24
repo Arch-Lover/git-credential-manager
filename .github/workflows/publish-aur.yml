@@ -38,7 +38,7 @@ jobs:
       - name: Check out package
         uses: actions/checkout@v6
 
-      - name: Build package in a clean Arch Linux container
+      - name: Build package and generate fresh metadata
         shell: bash
         run: |
           set -euo pipefail
@@ -55,7 +55,6 @@ jobs:
 
               useradd --create-home builder
 
-              # Allow the disposable build user to install dependencies.
               printf "builder ALL=(ALL) NOPASSWD: /usr/bin/pacman\n" \
                 > /etc/sudoers.d/builder
               chmod 440 /etc/sudoers.d/builder
@@ -68,12 +67,10 @@ jobs:
                 bash -euo pipefail -c "
                   cd /build
 
-                  # Reject stale or inconsistent committed metadata.
-                  makepkg --printsrcinfo > .SRCINFO.generated
-                  cmp .SRCINFO .SRCINFO.generated
-                  rm .SRCINFO.generated
+                  # Generate metadata instead of trusting a possibly stale file.
+                  makepkg --printsrcinfo > .SRCINFO
 
-                  # Build and install missing dependencies inside the container.
+                  # Build and install missing dependencies.
                   makepkg --syncdeps --noconfirm --cleanbuild
                 "
 
@@ -88,10 +85,10 @@ jobs:
                 ! -name "*.sig" \
                 -exec cp {} /out/ \;
 
-              compgen -G "/out/*.pkg.tar.*" > /dev/null || {
+              if ! compgen -G "/out/*.pkg.tar.*" > /dev/null; then
                 echo "No package archive was produced." >&2
                 exit 1
-              }
+              fi
             '
 
       - name: Upload built package
@@ -102,7 +99,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Upload AUR source bundle
+      - name: Upload generated AUR sources
         uses: actions/upload-artifact@v4
         with:
           name: aur-source-bundle
@@ -135,11 +132,11 @@ jobs:
           set -euo pipefail
 
           if [[ -z "$AUR_SSH_PRIVATE_KEY" ]]; then
-            echo "Missing required AUR_SSH_KEY GitHub secret." >&2
+            echo "Missing required AUR_SSH_KEY secret." >&2
             exit 1
           fi
 
-      - name: Download generated AUR files
+      - name: Download generated AUR sources
         uses: actions/download-artifact@v4
         with:
           name: aur-source-bundle
@@ -152,7 +149,6 @@ jobs:
 
           install -d -m 700 ~/.ssh
 
-          # Normalize CRLF in secrets copied from Windows.
           printf '%s' "$AUR_SSH_PRIVATE_KEY" |
             tr -d '\r' > ~/.ssh/aur_key
           printf '\n' >> ~/.ssh/aur_key
@@ -180,7 +176,7 @@ jobs:
             "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" \
             "$aur_dir"
 
-          # Keep .git, but remove old package files.
+          # Preserve .git while replacing the tracked recipe files.
           find "$aur_dir" \
             -mindepth 1 \
             -maxdepth 1 \
@@ -212,7 +208,5 @@ jobs:
             exit 1
           fi
 
-          git commit \
-            -m "Update to ${version}-${release}"
-
+          git commit -m "Update to ${version}-${release}"
           git push origin HEAD:master
