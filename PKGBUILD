@@ -29,9 +29,16 @@ sha512sums=('1e7c2cb1b16fb5f0f09598e194b7421327e46bdc3aa59a59b8ca83926121653015b
 
 build() {
     cd "${pkgbase}-${pkgver}"
-printf '%s\n' '--- Source directory ---'
-pwd
-printf '%s\n' '--- Solution files ---'
+printf '%s\n' '--- Linux packaging project files ---'
+find . -type f \( \
+    -iname '*packaging*.csproj' -o \
+    -iname '*.csproj' -o \
+    -iname '*.slnx' \
+\) -print | sort
+
+printf '%s\n' '--- References to the expected output directory ---'
+grep -R -n --include='*.csproj' --include='*.props' \
+    --include='*.targets' 'Packaging.Linux\|payload' . || true
 find . -maxdepth 3 -type f \( -name '*.sln' -o -name '*.slnx' \) -print
     export DOTNET_CLI_HOME="$srcdir/.dotnet"
     export HOME="$srcdir/.home"
