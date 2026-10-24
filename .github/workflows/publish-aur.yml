@@ -1,9 +1,14 @@
+
 name: Publish to AUR
 
 on:
   push:
     branches:
       - main
+    paths:
+      - PKGBUILD
+      - .SRCINFO
+      - .github/workflows/aur-publish.yml
   workflow_dispatch:
 
 permissions:
@@ -11,57 +16,103 @@ permissions:
 
 jobs:
   publish:
+    name: Publish package recipe to AUR
     runs-on: ubuntu-latest
+
+    env:
+      AUR_PACKAGE: git-credential-manager
+      AUR_GIT_NAME: GitHub Actions
+      AUR_GIT_EMAIL: actions@users.noreply.github.com
+      AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
 
     steps:
       - name: Check out package
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Publish package to AUR
-        env:
-          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+      - name: Validate package sources
         shell: bash
         run: |
           set -euo pipefail
 
-          [[ -n "$AUR_SSH_KEY" ]] || {
-            echo "AUR_SSH_KEY is not configured." >&2
+          for file in PKGBUILD .SRCINFO; do
+            if [[ ! -f "$file" ]]; then
+              echo "Required package source file is missing: $file" >&2
+              exit 1
+            fi
+          done
+
+      - name: Check AUR credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$AUR_SSH_KEY" ]]; then
+            echo "Missing required AUR_SSH_KEY GitHub secret." >&2
             exit 1
-          }
+          fi
+
+      - name: Configure SSH for the AUR
+        shell: bash
+        run: |
+          set -euo pipefail
 
           install -d -m 700 ~/.ssh
 
-          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur_key
+          # Normalize CRLF line endings in the GitHub secret.
+          printf '%s' "$AUR_SSH_KEY" |
+            tr -d '\r' > ~/.ssh/aur_key
+          printf '\n' >> ~/.ssh/aur_key
+
           chmod 600 ~/.ssh/aur_key
 
-          ssh-keyscan \
-            -H \
-            aur.archlinux.org \
-            > ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/aur_key > /dev/null || {
+            echo "AUR_SSH_KEY is not a valid OpenSSH private key." >&2
+            exit 1
+          }
+
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
 
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes"
 
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Persist SSH configuration for subsequent workflow steps.
+          echo "GIT_SSH_COMMAND=$GIT_SSH_COMMAND" >> "$GITHUB_ENV"
+
+      - name: Update the AUR repository
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aur_dir="$RUNNER_TEMP/aur-repository"
 
           git clone \
-            ssh://aur@aur.archlinux.org/git-credential-manager.git \
-            aur
+            "ssh://aur@aur.archlinux.org/${AUR_PACKAGE}.git" \
+            "$aur_dir"
 
-          cp PKGBUILD .SRCINFO aur/
+          # Replace only the package files, preserving Git metadata.
+          cp PKGBUILD .SRCINFO "$aur_dir/"
 
-          cd aur
+          cd "$aur_dir"
 
-          if git diff --quiet -- PKGBUILD .SRCINFO; then
-            echo "AUR is already up to date."
-            exit 0
-          fi
+          git config user.name "$AUR_GIT_NAME"
+          git config user.email "$AUR_GIT_EMAIL"
 
           git add PKGBUILD .SRCINFO
 
-          version="$(sed -n 's/^pkgver=//p' PKGBUILD)"
+          # Check the staged changes, not the working tree.
+          if git diff --cached --quiet; then
+            echo "AUR already contains these package sources; nothing to publish."
+            exit 0
+          fi
+
+          version="$(sed -n 's/^pkgver=//p' PKGBUILD | head -n 1)"
+          release="$(sed -n 's/^pkgrel=//p' PKGBUILD | head -n 1)"
+
+          if [[ -z "$version" || -z "$release" ]]; then
+            echo "Could not determine pkgver or pkgrel from PKGBUILD." >&2
+            exit 1
+          fi
 
           git commit \
-            -m "Update git-credential-manager to $version"
+            -m "Update git-credential-manager to ${version}-${release}"
 
-          git push origin master
+          git push origin HEAD:master
