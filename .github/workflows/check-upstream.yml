@@ -59,7 +59,6 @@ jobs:
           {
             echo "current=$current"
             echo "latest=$latest"
-
             if [[ "$current" != "$latest" ]]; then
               echo "updates_available=true"
             else
@@ -70,21 +69,10 @@ jobs:
           echo "Packaged version: $current"
           echo "Upstream version: $latest"
 
-      - name: Update version and release number
+      - name: Generate updated recipe, checksums, and metadata
         if: steps.versions.outputs.updates_available == 'true'
         env:
           LATEST: ${{ steps.versions.outputs.latest }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sed -i -E \
-            -e "s/^pkgver=.*/pkgver=$LATEST/" \
-            -e 's/^pkgrel=.*/pkgrel=1/' \
-            PKGBUILD
-
-      - name: Regenerate checksums and package metadata
-        if: steps.versions.outputs.updates_available == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -105,17 +93,18 @@ jobs:
               cp -a /source/. /build/
               chown -R builder:builder /build
 
+              # Set the requested version and reset pkgrel.
+              sed -i \
+                -e "s/^pkgver=.*/pkgver='"$LATEST"'/" \
+                -e "s/^pkgrel=.*/pkgrel=1/" \
+                /build/PKGBUILD
+
               runuser -u builder -- \
                 bash -euo pipefail -c "
                   cd /build
 
-                  # Update the existing checksum arrays in PKGBUILD.
                   updpkgsums
-
-                  # Verify the downloaded sources against the new checksums.
                   makepkg --verifysource
-
-                  # Generate metadata from the updated recipe.
                   makepkg --printsrcinfo > .SRCINFO
                 "
 
@@ -123,23 +112,19 @@ jobs:
               cp /build/.SRCINFO /out/.SRCINFO
             '
 
-          # Copy generated files back out of the container.
           cp "$output_dir/PKGBUILD" "$GITHUB_WORKSPACE/PKGBUILD"
           cp "$output_dir/.SRCINFO" "$GITHUB_WORKSPACE/.SRCINFO"
 
-          echo "Updated PKGBUILD:"
-          grep -E '^(pkgver|pkgrel|sha[0-9]+sums)=' PKGBUILD || true
-
-          echo "Updated .SRCINFO:"
+          echo "Generated metadata:"
           grep -E '^[[:space:]]*(pkgver|pkgrel)[[:space:]]' .SRCINFO
 
-      - name: Validate package metadata
+      - name: Validate generated metadata
         if: steps.versions.outputs.updates_available == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          output_dir="$RUNNER_TEMP/package-validation"
+          output_dir="$RUNNER_TEMP/metadata-validation"
           mkdir -p "$output_dir"
 
           docker run --rm \
@@ -147,7 +132,7 @@ jobs:
             --volume "$output_dir:/out" \
             archlinux:latest \
             bash -euo pipefail -c '
-              pacman -Syu --noconfirm --needed base-devel pacman-contrib
+              pacman -Syu --noconfirm --needed base-devel
 
               useradd --create-home builder
               install -d -o builder -g builder /build
@@ -158,19 +143,17 @@ jobs:
               runuser -u builder -- \
                 bash -euo pipefail -c "
                   cd /build
-                  makepkg --verifysource
                   makepkg --printsrcinfo > /out/.SRCINFO
                 "
             '
 
-          # Ensure the checked-in metadata matches the generated metadata.
           if ! cmp -s .SRCINFO "$output_dir/.SRCINFO"; then
-            echo "Committed .SRCINFO differs from generated metadata." >&2
+            echo "Generated .SRCINFO does not match the recipe." >&2
             diff -u .SRCINFO "$output_dir/.SRCINFO" || true
             exit 1
           fi
 
-      - name: Create or update upstream pull request
+      - name: Create or update pull request
         if: steps.versions.outputs.updates_available == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -183,7 +166,6 @@ jobs:
           saved_dir="$RUNNER_TEMP/updated-package"
           mkdir -p "$saved_dir"
 
-          # Preserve the generated files before switching branches.
           cp PKGBUILD .SRCINFO "$saved_dir/"
 
           git config user.name 'github-actions[bot]'
@@ -192,10 +174,6 @@ jobs:
 
           git fetch origin
 
-          # Discard only the local working-tree changes after saving them.
-          git reset --hard HEAD
-
-          # Reuse an existing remote branch when one exists.
           if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
             git checkout -B "$branch" "origin/$branch"
           else
@@ -206,13 +184,11 @@ jobs:
 
           git add PKGBUILD .SRCINFO
 
-          if git diff --cached --quiet; then
-            echo "No additional changes to commit on $branch."
-          else
-            git commit \
-              -m "Update git-credential-manager to $LATEST"
-
+          if ! git diff --cached --quiet; then
+            git commit -m "Update git-credential-manager to $LATEST"
             git push origin "HEAD:refs/heads/$branch"
+          else
+            echo "The update branch already contains these changes."
           fi
 
           existing_pr="$(
@@ -224,7 +200,7 @@ jobs:
           )"
 
           if [[ -n "$existing_pr" ]]; then
-            echo "Updated existing pull request #$existing_pr."
+            echo "Pull request #$existing_pr is already open."
             exit 0
           fi
 
@@ -232,18 +208,11 @@ jobs:
             --base main \
             --head "$branch" \
             --title "Update git-credential-manager to $LATEST" \
-            --body "$(cat <<EOF
-          Automated upstream update.
+            --body "Automated upstream update to v${LATEST}.
 
-          Upstream release: v${LATEST}
+          - Updated pkgver and reset pkgrel.
+          - Regenerated source checksums.
+          - Verified source files.
+          - Regenerated and validated .SRCINFO.
 
-          Changes:
-          - Updated pkgver
-          - Reset pkgrel to 1
-          - Regenerated checksums using updpkgsums
-          - Verified upstream source files
-          - Regenerated and validated .SRCINFO
-
-          Please review the package changes before merging.
-          EOF
-          )"
+          Please review before merging."
