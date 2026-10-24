@@ -1,3 +1,4 @@
+
 name: Check upstream versions
 
 on:
@@ -9,13 +10,20 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: check-upstream
+  cancel-in-progress: false
+
 jobs:
   check:
+    name: Check and prepare upstream update
     runs-on: ubuntu-latest
 
     steps:
       - name: Check out package recipe
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Compare packaged and upstream versions
         id: versions
@@ -23,9 +31,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          current="$(sed -n 's/^pkgver=//p' PKGBUILD)"
+          current="$(sed -n 's/^pkgver=//p' PKGBUILD | head -n 1)"
 
-          latest="$({
+          latest="$(
             curl \
               --fail \
               --location \
@@ -33,19 +41,18 @@ jobs:
               --silent \
               --show-error \
               https://api.github.com/repos/git-ecosystem/git-credential-manager/releases/latest |
-              jq --raw-output '.tag_name' |
-              sed 's/^v//'
-          })"
+              jq --exit-status --raw-output '.tag_name | ltrimstr("v")'
+          )"
 
           version_pattern='^[0-9]+(\.[0-9]+){2,3}$'
 
           [[ "$current" =~ $version_pattern ]] || {
-            echo "Could not determine a valid packaged version: $current" >&2
+            echo "Invalid current pkgver: $current" >&2
             exit 1
           }
 
           [[ "$latest" =~ $version_pattern ]] || {
-            echo "Could not determine a valid upstream version: $latest" >&2
+            echo "Invalid upstream version: $latest" >&2
             exit 1
           }
 
@@ -54,16 +61,16 @@ jobs:
             echo "latest=$latest"
 
             if [[ "$current" != "$latest" ]]; then
-              echo 'updates_available=true'
+              echo "updates_available=true"
             else
-              echo 'updates_available=false'
+              echo "updates_available=false"
             fi
           } >> "$GITHUB_OUTPUT"
 
-          echo "Packaged GCM: $current"
-          echo "Upstream GCM: $latest"
+          echo "Packaged version: $current"
+          echo "Upstream version: $latest"
 
-      - name: Generate updated package metadata
+      - name: Update version and release number
         if: steps.versions.outputs.updates_available == 'true'
         env:
           LATEST: ${{ steps.versions.outputs.latest }}
@@ -71,21 +78,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Upstream version changed, so reset pkgrel.
-          pkgrel=1
-
           sed -i -E \
             -e "s/^pkgver=.*/pkgver=$LATEST/" \
-            -e "s/^pkgrel=.*/pkgrel=$pkgrel/" \
+            -e 's/^pkgrel=.*/pkgrel=1/' \
             PKGBUILD
 
-      - name: Regenerate source checksums
+      - name: Regenerate checksums and package metadata
         if: steps.versions.outputs.updates_available == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          output_dir="$RUNNER_TEMP/checksums"
+          output_dir="$RUNNER_TEMP/package-metadata"
           mkdir -p "$output_dir"
 
           docker run --rm \
@@ -93,72 +97,41 @@ jobs:
             --volume "$output_dir:/out" \
             archlinux:latest \
             bash -euo pipefail -c '
-              pacman -Syu --noconfirm --needed base-devel
+              pacman -Syu --noconfirm --needed base-devel pacman-contrib
 
               useradd --create-home builder
+              install -d -o builder -g builder /build
 
-              cp -a /source/. /build
+              cp -a /source/. /build/
               chown -R builder:builder /build
 
-              runuser -u builder -- bash -euo pipefail -c "
-                cd /build
-                makepkg -g
-              " > /out/checksums
+              runuser -u builder -- \
+                bash -euo pipefail -c "
+                  cd /build
+
+                  # Update the existing checksum arrays in PKGBUILD.
+                  updpkgsums
+
+                  # Verify the downloaded sources against the new checksums.
+                  makepkg --verifysource
+
+                  # Generate metadata from the updated recipe.
+                  makepkg --printsrcinfo > .SRCINFO
+                "
+
+              cp /build/PKGBUILD /out/PKGBUILD
+              cp /build/.SRCINFO /out/.SRCINFO
             '
 
-          awk '
-            /^sha512sums=\(/ {
-              found = 1
-              print
-              next
-            }
+          # Copy generated files back out of the container.
+          cp "$output_dir/PKGBUILD" "$GITHUB_WORKSPACE/PKGBUILD"
+          cp "$output_dir/.SRCINFO" "$GITHUB_WORKSPACE/.SRCINFO"
 
-            found {
-              print
+          echo "Updated PKGBUILD:"
+          grep -E '^(pkgver|pkgrel|sha[0-9]+sums)=' PKGBUILD || true
 
-              if (/\)/)
-                exit
-            }
-          ' "$output_dir/checksums" > "$output_dir/sha512sums"
-
-          [[ -s "$output_dir/sha512sums" ]] || {
-            echo "Failed to generate sha512sums." >&2
-            cat "$output_dir/checksums" >&2
-            exit 1
-          }
-
-          awk \
-            -v replacement="$output_dir/sha512sums" '
-              BEGIN {
-                while ((getline line < replacement) > 0)
-                  replacement_lines[++n] = line
-                close(replacement)
-              }
-
-              /^sha512sums=\(/ {
-                for (i = 1; i <= n; i++)
-                  print replacement_lines[i]
-
-                skip = 1
-                next
-              }
-
-              skip {
-                if (/\)/)
-                  skip = 0
-                next
-              }
-
-              {
-                print
-              }
-            ' \
-            PKGBUILD > PKGBUILD.updated
-
-          mv PKGBUILD.updated PKGBUILD
-
-          echo "Generated checksums:"
-          grep -A3 '^sha512sums=' PKGBUILD
+          echo "Updated .SRCINFO:"
+          grep -E '^[[:space:]]*(pkgver|pkgrel)[[:space:]]' .SRCINFO
 
       - name: Validate package metadata
         if: steps.versions.outputs.updates_available == 'true'
@@ -166,25 +139,38 @@ jobs:
         run: |
           set -euo pipefail
 
+          output_dir="$RUNNER_TEMP/package-validation"
+          mkdir -p "$output_dir"
+
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/source:ro" \
+            --volume "$output_dir:/out" \
             archlinux:latest \
             bash -euo pipefail -c '
-              pacman -Syu --noconfirm --needed base-devel
+              pacman -Syu --noconfirm --needed base-devel pacman-contrib
 
               useradd --create-home builder
+              install -d -o builder -g builder /build
 
-              cp -a /source/. /build
+              cp -a /source/. /build/
               chown -R builder:builder /build
 
-              runuser -u builder -- bash -euo pipefail -c "
-                cd /build
-                makepkg --verifysource
-                makepkg --printsrcinfo > .SRCINFO
-              "
+              runuser -u builder -- \
+                bash -euo pipefail -c "
+                  cd /build
+                  makepkg --verifysource
+                  makepkg --printsrcinfo > /out/.SRCINFO
+                "
             '
 
-      - name: Create or update pull request
+          # Ensure the checked-in metadata matches the generated metadata.
+          if ! cmp -s .SRCINFO "$output_dir/.SRCINFO"; then
+            echo "Committed .SRCINFO differs from generated metadata." >&2
+            diff -u .SRCINFO "$output_dir/.SRCINFO" || true
+            exit 1
+          fi
+
+      - name: Create or update upstream pull request
         if: steps.versions.outputs.updates_available == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -194,47 +180,70 @@ jobs:
           set -euo pipefail
 
           branch="automation/upstream-${LATEST}"
+          saved_dir="$RUNNER_TEMP/updated-package"
+          mkdir -p "$saved_dir"
+
+          # Preserve the generated files before switching branches.
+          cp PKGBUILD .SRCINFO "$saved_dir/"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email \
+            '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git fetch origin
+
+          # Discard only the local working-tree changes after saving them.
+          git reset --hard HEAD
+
+          # Reuse an existing remote branch when one exists.
+          if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            git checkout -B "$branch" "origin/$branch"
+          else
+            git checkout -B "$branch" origin/main
+          fi
+
+          cp "$saved_dir/PKGBUILD" "$saved_dir/.SRCINFO" .
+
+          git add PKGBUILD .SRCINFO
+
+          if git diff --cached --quiet; then
+            echo "No additional changes to commit on $branch."
+          else
+            git commit \
+              -m "Update git-credential-manager to $LATEST"
+
+            git push origin "HEAD:refs/heads/$branch"
+          fi
 
           existing_pr="$(
             gh pr list \
               --head "$branch" \
               --state open \
               --json number \
-              --jq '.[0].number'
+              --jq '.[0].number // empty'
           )"
 
           if [[ -n "$existing_pr" ]]; then
-            echo "Pull request #$existing_pr is already open."
+            echo "Updated existing pull request #$existing_pr."
             exit 0
           fi
-
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-
-          git fetch origin "$branch" || true
-          git checkout -B "$branch"
-
-          git add PKGBUILD .SRCINFO
-
-          git commit \
-            -m "Update git-credential-manager to $LATEST"
-
-          git push --force-with-lease origin "$branch"
 
           gh pr create \
             --base main \
             --head "$branch" \
             --title "Update git-credential-manager to $LATEST" \
-            --body \
-            "Automated upstream update.
+            --body "$(cat <<EOF
+          Automated upstream update.
 
-          Upstream release: v$LATEST
+          Upstream release: v${LATEST}
 
           Changes:
           - Updated pkgver
-          - Reset pkgrel
-          - Regenerated sha512sums
-          - Regenerated .SRCINFO
-          - Verified package sources
+          - Reset pkgrel to 1
+          - Regenerated checksums using updpkgsums
+          - Verified upstream source files
+          - Regenerated and validated .SRCINFO
 
-          Please review the upstream release and package changes before merging."
+          Please review the package changes before merging.
+          EOF
+          )"
