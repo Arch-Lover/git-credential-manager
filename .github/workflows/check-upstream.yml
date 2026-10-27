@@ -1,4 +1,4 @@
-
+```yaml
 name: Check upstream versions
 
 on:
@@ -59,6 +59,7 @@ jobs:
           {
             echo "current=$current"
             echo "latest=$latest"
+
             if [[ "$current" != "$latest" ]]; then
               echo "updates_available=true"
             else
@@ -108,6 +109,7 @@ jobs:
                   makepkg --printsrcinfo > .SRCINFO
                 "
 
+              # Copy as root so builder does not need write access to /out.
               cp /build/PKGBUILD /out/PKGBUILD
               cp /build/.SRCINFO /out/.SRCINFO
             '
@@ -140,11 +142,16 @@ jobs:
               cp -a /source/. /build/
               chown -R builder:builder /build
 
+              # Generate the metadata as the unprivileged builder.
+              # The output file is inside /build, which builder owns.
               runuser -u builder -- \
                 bash -euo pipefail -c "
                   cd /build
-                  makepkg --printsrcinfo > /out/.SRCINFO
+                  makepkg --printsrcinfo > .SRCINFO
                 "
+
+              # Copy the result as root to avoid /out permission errors.
+              cp /build/.SRCINFO /out/.SRCINFO
             '
 
           if ! cmp -s .SRCINFO "$output_dir/.SRCINFO"; then
@@ -152,6 +159,8 @@ jobs:
             diff -u .SRCINFO "$output_dir/.SRCINFO" || true
             exit 1
           fi
+
+          echo "Generated .SRCINFO matches the PKGBUILD."
 
       - name: Create or update pull request
         if: steps.versions.outputs.updates_available == 'true'
@@ -216,3 +225,4 @@ jobs:
           - Regenerated and validated .SRCINFO.
 
           Please review before merging."
+```
